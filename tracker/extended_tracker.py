@@ -22,6 +22,22 @@ State convention:
 
 Bearing convention:
     bearing = atan2(delta_E, delta_N), measured clockwise from North.
+    
+    
+use liek this:
+
+from extended_tracker_clean import ExtendedTracker
+
+tracker_ext = ExtendedTracker(
+    ekf=my_ekf,
+    coordinate_manager=my_coord_manager
+)
+
+tracker_ext.process_measurements_sequential(
+    measurements,
+    vessel_positions=vessel_positions,
+    allowed_sensors=("radar", "camera", "ais")
+)
 """
 
 from __future__ import annotations
