@@ -7,9 +7,20 @@ from coordinate_manager import CoordinateManager
 from extended_tracker import ExtendedTracker, initial_state_from_measurement
 
 
+# -------------------------------------------------------------------------
+# Basic helpers
+# -------------------------------------------------------------------------
+
 def load_json(path):
     with open(path, "r") as f:
         return json.load(f)
+
+
+def is_false_alarm(meas):
+    return (
+        meas.get("is_false_alarm", False)
+        or int(meas.get("true_target_id", meas.get("target_id", 0))) == -1
+    )
 
 
 def first_valid_measurement(measurements, allowed_sensors):
@@ -19,7 +30,7 @@ def first_valid_measurement(measurements, allowed_sensors):
         if sid not in allowed_sensors:
             continue
 
-        if int(m.get("true_target_id", m.get("target_id", 0))) == -1:
+        if is_false_alarm(m):
             continue
 
         return m
@@ -59,12 +70,8 @@ def compute_error_series(data, history):
     times, est_N, est_E = extract_estimates(history)
     gt_time, gt_N, gt_E, valid, _ = get_first_ground_truth(data)
 
-    gt_time_valid = gt_time[valid]
-    gt_N_valid = gt_N[valid]
-    gt_E_valid = gt_E[valid]
-
-    gt_N_interp = np.interp(times, gt_time_valid, gt_N_valid)
-    gt_E_interp = np.interp(times, gt_time_valid, gt_E_valid)
+    gt_N_interp = np.interp(times, gt_time[valid], gt_N[valid])
+    gt_E_interp = np.interp(times, gt_time[valid], gt_E[valid])
 
     error_N = est_N - gt_N_interp
     error_E = est_E - gt_E_interp
@@ -82,6 +89,7 @@ def compute_rmse(data, history):
 
 def compute_rmse_in_window(data, history, t_start, t_end):
     times, position_error, _ = compute_error_series(data, history)
+
     mask = (times >= t_start) & (times <= t_end)
 
     if np.sum(mask) == 0:
@@ -91,13 +99,7 @@ def compute_rmse_in_window(data, history, t_start, t_end):
 
 
 def compute_update_count_in_window(history, t_start, t_end):
-    count = 0
-
-    for h in history:
-        if t_start <= h["time"] <= t_end:
-            count += 1
-
-    return count
+    return sum(t_start <= h["time"] <= t_end for h in history)
 
 
 def print_pass_fail(name, passed, value_text=""):
@@ -106,86 +108,89 @@ def print_pass_fail(name, passed, value_text=""):
 
 
 # -------------------------------------------------------------------------
-# NIS FUNCTIONS
+# NIS
 # -------------------------------------------------------------------------
 
-def evaluate_nis_consistency(tracker_ext, ignore_first=0):
+def nis_bounds_for_sensor(sensor_name):
     """
-    Evaluates NIS consistency.
+    2 DOF:
+        radar, camera, ais range-bearing updates
 
-    Since radar, camera, and AIS converted measurements are:
-        z = [range, bearing]
-
-    the measurement dimension is 2.
-
-    95% chi-square bounds for 2 DOF:
-        lower = 0.103
-        upper = 5.991
-
-    ignore_first:
-        Can be used to ignore initial transient updates.
-        For official reporting, keep it at 0 unless you clearly state otherwise.
+    4 DOF:
+        joint radar-camera update:
+        z = [r_radar, bearing_radar, r_camera, bearing_camera]
     """
+    if sensor_name == "joint_radar_camera":
+        return 0.711, 9.488, 4
 
+    return 0.103, 5.991, 2
+
+
+def evaluate_nis_consistency(tracker_ext):
     if len(tracker_ext.nis_history) == 0:
         return {
             "available": False,
             "percentage_inside": np.nan,
             "mean_nis": np.nan,
-            "lower": 0.103,
-            "upper": 5.991,
             "n": 0,
             "by_sensor": {},
         }
 
-    nis_items = tracker_ext.nis_history[ignore_first:]
+    items = tracker_ext.nis_history
 
-    if len(nis_items) == 0:
-        return {
-            "available": False,
-            "percentage_inside": np.nan,
-            "mean_nis": np.nan,
-            "lower": 0.103,
-            "upper": 5.991,
-            "n": 0,
-            "by_sensor": {},
-        }
-
-    lower = 0.103
-    upper = 5.991
-
-    nis_values = np.array([item["nis"] for item in nis_items], dtype=float)
-    inside = (nis_values >= lower) & (nis_values <= upper)
-
+    inside_all = []
+    values_all = []
     by_sensor = {}
 
-    for sensor in sorted(set(item["sensor"] for item in nis_items)):
-        vals = np.array(
-            [item["nis"] for item in nis_items if item["sensor"] == sensor],
-            dtype=float,
-        )
+    for item in items:
+        sensor = item["sensor"]
+        nis = float(item["nis"])
 
-        inside_sensor = (vals >= lower) & (vals <= upper)
+        lower, upper, dof = nis_bounds_for_sensor(sensor)
 
-        by_sensor[sensor] = {
+        inside = lower <= nis <= upper
+
+        inside_all.append(inside)
+        values_all.append(nis)
+
+        if sensor not in by_sensor:
+            by_sensor[sensor] = {
+                "values": [],
+                "inside": [],
+                "lower": lower,
+                "upper": upper,
+                "dof": dof,
+            }
+
+        by_sensor[sensor]["values"].append(nis)
+        by_sensor[sensor]["inside"].append(inside)
+
+    by_sensor_out = {}
+
+    for sensor, d in by_sensor.items():
+        vals = np.asarray(d["values"])
+        inside = np.asarray(d["inside"])
+
+        by_sensor_out[sensor] = {
             "n": len(vals),
             "mean_nis": float(np.mean(vals)),
-            "percentage_inside": 100.0 * np.mean(inside_sensor),
+            "percentage_inside": 100.0 * np.mean(inside),
+            "lower": d["lower"],
+            "upper": d["upper"],
+            "dof": d["dof"],
         }
 
     return {
         "available": True,
-        "percentage_inside": 100.0 * np.mean(inside),
-        "mean_nis": float(np.mean(nis_values)),
-        "lower": lower,
-        "upper": upper,
-        "n": len(nis_values),
-        "by_sensor": by_sensor,
+        "percentage_inside": 100.0 * np.mean(inside_all),
+        "mean_nis": float(np.mean(values_all)),
+        "n": len(values_all),
+        "by_sensor": by_sensor_out,
     }
 
 
-def print_nis_consistency(tracker_ext, ignore_first=0):
-    result = evaluate_nis_consistency(tracker_ext, ignore_first=ignore_first)
+def print_nis_consistency(tracker_ext):
+    result = evaluate_nis_consistency(tracker_ext)
 
     print("\nNIS CONSISTENCY TEST")
     print("-" * 40)
@@ -196,21 +201,22 @@ def print_nis_consistency(tracker_ext, ignore_first=0):
 
     print(f"Number of NIS samples: {result['n']}")
     print(f"Mean NIS: {result['mean_nis']:.3f}")
-    print(f"95% chi-square bounds: [{result['lower']:.3f}, {result['upper']:.3f}]")
-    print(f"Percentage inside bounds: {result['percentage_inside']:.1f}%")
+    print(f"Percentage inside correct chi-square bounds: {result['percentage_inside']:.1f}%")
 
     print_pass_fail(
-        "> 90% NIS inside 95% bounds",
+        "> 90% NIS inside bounds",
         result["percentage_inside"] >= 90.0,
         f"({result['percentage_inside']:.1f}%)",
     )
 
-    print("\nPer-sensor NIS:")
+    print("\nPer-sensor / per-update NIS:")
     for sensor, stats in result["by_sensor"].items():
         print(
             f"- {sensor}: "
             f"{stats['percentage_inside']:.1f}% inside, "
             f"mean NIS = {stats['mean_nis']:.2f}, "
+            f"DOF = {stats['dof']}, "
+            f"bounds = [{stats['lower']:.3f}, {stats['upper']:.3f}], "
             f"n = {stats['n']}"
         )
 
@@ -222,300 +228,38 @@ def plot_nis(tracker_ext):
         print("No NIS values to plot.")
         return
 
-    nis_times = np.array([item["time"] for item in tracker_ext.nis_history])
-    nis_values = np.array([item["nis"] for item in tracker_ext.nis_history])
-    nis_sensors = [item["sensor"] for item in tracker_ext.nis_history]
-
-    lower = 0.103
-    upper = 5.991
-
     plt.figure(figsize=(9, 4))
 
-    for sensor in sorted(set(nis_sensors)):
-        idx = [i for i, s in enumerate(nis_sensors) if s == sensor]
-        plt.scatter(nis_times[idx], nis_values[idx], s=15, label=sensor)
+    sensors = sorted(set(item["sensor"] for item in tracker_ext.nis_history))
 
-    plt.axhline(lower, linestyle="--", label="95% lower bound")
-    plt.axhline(upper, linestyle="--", label="95% upper bound")
+    for sensor in sensors:
+        times = []
+        values = []
+
+        for item in tracker_ext.nis_history:
+            if item["sensor"] == sensor:
+                times.append(item["time"])
+                values.append(item["nis"])
+
+        lower, upper, dof = nis_bounds_for_sensor(sensor)
+
+        plt.scatter(times, values, s=15, label=f"{sensor} ({dof} DOF)")
+
+    plt.axhline(5.991, linestyle="--", label="2 DOF upper 95%")
+    plt.axhline(9.488, linestyle="--", label="4 DOF upper 95%")
 
     plt.xlabel("Time [s]")
     plt.ylabel("NIS")
-    plt.title("NIS consistency test")
+    plt.title("NIS consistency")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
     plt.show()
 
 
-def print_success_criteria(data, history, allowed_sensors, tracker_ext=None):
-    scenario = str(data.get("scenario_name", "")).upper()
-    rmse = compute_rmse(data, history)
-
-    nis_result = None
-    if tracker_ext is not None:
-        nis_result = evaluate_nis_consistency(tracker_ext)
-
-    print("\n" + "=" * 60)
-    print(f"SCENARIO {scenario} SUCCESS CRITERIA")
-    print("=" * 60)
-
-    if scenario == "A":
-        print("Expected criteria:")
-        print("- Radar-only single target")
-        print("- Track confirmed within 5 scans")
-        print("- Steady-state RMSE < 12 m")
-        print("- > 90% NIS inside 95% chi-square bounds")
-
-        rmse_steady = compute_rmse_in_window(data, history, 30.0, data["t_end"])
-
-        print("\nMeasured:")
-        print(f"- Overall RMSE: {rmse:.2f} m")
-        print(f"- Steady-state RMSE from 30 s: {rmse_steady:.2f} m")
-        print(f"- Number of EKF updates: {len(history)}")
-
-        if nis_result is not None and nis_result["available"]:
-            print(f"- NIS inside 95% bounds: {nis_result['percentage_inside']:.1f}%")
-            print(f"- Mean NIS: {nis_result['mean_nis']:.2f}")
-
-        print("\nPass/fail:")
-        print_pass_fail(
-            "Steady-state RMSE < 12 m",
-            rmse_steady < 12.0,
-            f"({rmse_steady:.2f} m)",
-        )
-
-        if nis_result is not None and nis_result["available"]:
-            print_pass_fail(
-                "> 90% NIS inside 95% bounds",
-                nis_result["percentage_inside"] >= 90.0,
-                f"({nis_result['percentage_inside']:.1f}%)",
-            )
-
-        print("INFO: Track confirmation needs T7 track management.")
-
-    elif scenario == "B":
-        print("Expected criteria:")
-        print("- Single target with radar + stereo camera")
-        print("- Target crosses camera FOV around t = 20-80 s")
-        print("- Quantitative RMSE improvement: camera fusion vs radar-only")
-        print("- NIS consistent for sequential and centralised architectures")
-
-        rmse_fov = compute_rmse_in_window(data, history, 20.0, 80.0)
-
-        print("\nMeasured:")
-        print(f"- Overall RMSE: {rmse:.2f} m")
-        print(f"- RMSE during camera-FOV window 20-80 s: {rmse_fov:.2f} m")
-        print(f"- Sensors used: {allowed_sensors}")
-
-        if nis_result is not None and nis_result["available"]:
-            print(f"- NIS inside 95% bounds: {nis_result['percentage_inside']:.1f}%")
-            print(f"- Mean NIS: {nis_result['mean_nis']:.2f}")
-
-        print("\nPass/fail:")
-
-        if nis_result is not None and nis_result["available"]:
-            print_pass_fail(
-                "NIS consistency for this run",
-                nis_result["percentage_inside"] >= 90.0,
-                f"({nis_result['percentage_inside']:.1f}%)",
-            )
-
-        print("INFO: Full Scenario B validation requires radar-only vs radar+camera comparison.")
-        print("INFO: Centralised/joint update still needs to be run separately if required.")
-
-    elif scenario == "C":
-        print("Expected criteria:")
-        print("- AIS-equipped target")
-        print("- All sensors active")
-        print("- AIS dropout from t = 60-90 s")
-        print("- Track survives dropout")
-        print("- RMSE lower with AIS during available windows")
-        print("- Smooth reacquisition after dropout")
-
-        rmse_before_dropout = compute_rmse_in_window(data, history, 0.0, 60.0)
-        rmse_dropout = compute_rmse_in_window(data, history, 60.0, 90.0)
-        rmse_after_dropout = compute_rmse_in_window(data, history, 90.0, data["t_end"])
-        updates_dropout = compute_update_count_in_window(history, 60.0, 90.0)
-
-        print("\nMeasured:")
-        print(f"- Overall RMSE: {rmse:.2f} m")
-        print(f"- RMSE before AIS dropout 0-60 s: {rmse_before_dropout:.2f} m")
-        print(f"- RMSE during AIS dropout 60-90 s: {rmse_dropout:.2f} m")
-        print(f"- RMSE after AIS dropout 90-end s: {rmse_after_dropout:.2f} m")
-        print(f"- Updates during dropout: {updates_dropout}")
-
-        if nis_result is not None and nis_result["available"]:
-            print(f"- NIS inside 95% bounds: {nis_result['percentage_inside']:.1f}%")
-            print(f"- Mean NIS: {nis_result['mean_nis']:.2f}")
-
-        print("\nPass/fail:")
-        print_pass_fail(
-            "Track survives AIS dropout",
-            updates_dropout > 0 and not np.isnan(rmse_dropout),
-            f"(updates during dropout = {updates_dropout})",
-        )
-
-        print_pass_fail(
-            "Reacquisition after dropout",
-            not np.isnan(rmse_after_dropout),
-            f"(after-dropout RMSE = {rmse_after_dropout:.2f} m)",
-        )
-
-        if nis_result is not None and nis_result["available"]:
-            print_pass_fail(
-                "> 90% NIS inside 95% bounds",
-                nis_result["percentage_inside"] >= 90.0,
-                f"({nis_result['percentage_inside']:.1f}%)",
-            )
-
-        print("INFO: To prove AIS improvement, run Scenario C twice:")
-        print("      1) allowed_sensors=('radar','camera')")
-        print("      2) allowed_sensors=('radar','camera','ais')")
-
-    elif scenario == "D":
-        print("Expected criteria:")
-        print("- 4 crossing targets")
-        print("- All 4 tracks maintained")
-        print("- No identity swap")
-        print("- MOTP < 15 m")
-        print("- CE < 0.5")
-        print("\nINFO: Requires T6/T7 multi-target tracking.")
-
-    elif scenario == "E":
-        print("Expected criteria:")
-        print("- 6 targets, mixed AIS and non-AIS")
-        print("- All 6 targets tracked")
-        print("- MOTP < 20 m")
-        print("- CE < 1.0")
-        print("\nINFO: Requires complete T6/T7 pipeline.")
-
-    else:
-        print("Unknown scenario.")
-
-    print("=" * 60 + "\n")
-
-
-def compare_scenario_B_fusion():
-    """
-    Scenario B validation.
-
-    Required by the project:
-        - Compare radar-only against radar + camera on Scenario B.
-        - Check RMSE improvement.
-        - Check NIS consistency for the sequential architecture.
-
-    Centralised/joint update can be added later.
-    """
-
-    path = "harbour_sim_output/scenario_B.json"
-    data = load_json(path)
-
-    print("\n" + "=" * 70)
-    print("SCENARIO B FUSION COMPARISON")
-    print("=" * 70)
-
-    print("\n--- Scenario B: radar only ---")
-    tracker_radar = main(
-        path,
-        allowed_sensors=("radar",),
-        show_plots=False,
-    )
-
-    rmse_radar = compute_rmse(data, tracker_radar.history)
-    nis_radar = evaluate_nis_consistency(tracker_radar)
-
-    print("\n--- Scenario B: radar + camera sequential ---")
-    tracker_seq = main(
-        path,
-        allowed_sensors=("radar", "camera"),
-        show_plots=False,
-    )
-
-    rmse_seq = compute_rmse(data, tracker_seq.history)
-    nis_seq = evaluate_nis_consistency(tracker_seq)
-
-    improvement = 100.0 * (rmse_radar - rmse_seq) / rmse_radar
-
-    print("\n" + "=" * 70)
-    print("SCENARIO B SUMMARY")
-    print("=" * 70)
-
-    print(f"Radar-only RMSE                    : {rmse_radar:.2f} m")
-    print(f"Radar + camera sequential RMSE     : {rmse_seq:.2f} m")
-    print(f"RMSE improvement                   : {improvement:.1f}%")
-
-    print(f"Radar-only NIS inside 95%          : {nis_radar['percentage_inside']:.1f}%")
-    print(f"Sequential NIS inside 95%          : {nis_seq['percentage_inside']:.1f}%")
-
-    print("\nPass/fail:")
-    print_pass_fail(
-        "Camera fusion improves RMSE",
-        rmse_seq < rmse_radar,
-        f"({rmse_radar:.2f} m -> {rmse_seq:.2f} m)",
-    )
-
-    print_pass_fail(
-        "Sequential NIS >= 90%",
-        nis_seq["percentage_inside"] >= 90.0,
-        f"({nis_seq['percentage_inside']:.1f}%)",
-    )
-
-    print("INFO: Add centralised/joint update result when implemented.")
-    print("=" * 70)
-
-    plot_harbour_debug(data, tracker_seq.history)
-    plot_nis(tracker_seq)
-
-
-def compare_scenarios_A_B_C():
-    print("\n" + "=" * 70)
-    print("SCENARIO A/B/C COMPARISON")
-    print("=" * 70)
-
-    results = []
-
-    experiments = [
-        ("Scenario A", "harbour_sim_output/scenario_A.json", ("radar",)),
-        ("Scenario B", "harbour_sim_output/scenario_B.json", ("radar", "camera")),
-        ("Scenario C", "harbour_sim_output/scenario_C.json", ("radar", "camera", "ais")),
-    ]
-
-    for name, path, sensors in experiments:
-        print("\n" + "-" * 70)
-        print(f"Running {name} with sensors {sensors}")
-        print("-" * 70)
-
-        tracker = main(path, allowed_sensors=sensors, show_plots=False)
-
-        data = load_json(path)
-        rmse = compute_rmse(data, tracker.history)
-        nis = evaluate_nis_consistency(tracker)
-
-        results.append(
-            {
-                "scenario": name,
-                "sensors": sensors,
-                "rmse": rmse,
-                "updates": len(tracker.history),
-                "nis_inside": nis["percentage_inside"],
-            }
-        )
-
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-
-    for r in results:
-        print(
-            f"{r['scenario']:<12} | "
-            f"Sensors: {str(r['sensors']):<30} | "
-            f"RMSE: {r['rmse']:.2f} m | "
-            f"NIS inside: {r['nis_inside']:.1f}% | "
-            f"Updates: {r['updates']}"
-        )
-
-    print("=" * 70)
-
+# -------------------------------------------------------------------------
+# Plotting
+# -------------------------------------------------------------------------
 
 def plot_harbour_debug(data, history):
     measurements = data["measurements"]
@@ -531,41 +275,6 @@ def plot_harbour_debug(data, history):
 
     ax.plot(gt_E[valid], gt_N[valid], label=f"Ground Truth Target {target_id}")
     ax.plot(est_E, est_N, label="EKF Track")
-
-    legend_added = set()
-
-    for m in measurements:
-        sensor = m["sensor_id"].lower()
-
-        is_false = (
-            m.get("is_false_alarm", False)
-            or int(m.get("true_target_id", m.get("target_id", 0))) == -1
-        )
-
-        if sensor in ["radar", "camera"] and "range_m" in m and "bearing_rad" in m:
-            r = m["range_m"]
-            theta = m["bearing_rad"]
-
-            if sensor == "radar":
-                x = r * np.sin(theta)
-                y = r * np.cos(theta)
-
-            elif sensor == "camera":
-                cam_n, cam_e = -80.0, 120.0
-                x = cam_e + r * np.sin(theta)
-                y = cam_n + r * np.cos(theta)
-
-            color = "blue" if sensor == "radar" else "red"
-            marker = "x" if is_false else "o"
-            alpha = 0.1 if is_false else 0.7
-            size = 3 if is_false else 20
-            label = f"{sensor} {'false' if is_false else 'true'}"
-
-            if label not in legend_added:
-                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=size, label=label)
-                legend_added.add(label)
-            else:
-                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=size)
 
     radar_circle = plt.Circle(
         (0, 0),
@@ -609,12 +318,7 @@ def plot_harbour_debug(data, history):
 
         for m in measurements:
             if m["sensor_id"].lower() == sensor and "range_m" in m:
-                is_false = (
-                    m.get("is_false_alarm", False)
-                    or int(m.get("true_target_id", m.get("target_id", 0))) == -1
-                )
-
-                if is_false:
+                if is_false_alarm(m):
                     t_false.append(m["time"])
                     r_false.append(m["range_m"])
                 else:
@@ -625,7 +329,7 @@ def plot_harbour_debug(data, history):
             ax.scatter(t_true, r_true, s=8, label=f"{sensor} true")
 
         if len(t_false) > 0:
-            ax.scatter(t_false, r_false, s=2, label=f"{sensor} false", alpha=0.1, marker="x")
+            ax.scatter(t_false, r_false, s=2, alpha=0.1, marker="x", label=f"{sensor} false")
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Range [m]")
@@ -643,12 +347,7 @@ def plot_harbour_debug(data, history):
 
         for m in measurements:
             if m["sensor_id"].lower() == sensor and "bearing_rad" in m:
-                is_false = (
-                    m.get("is_false_alarm", False)
-                    or int(m.get("true_target_id", m.get("target_id", 0))) == -1
-                )
-
-                if is_false:
+                if is_false_alarm(m):
                     t_false.append(m["time"])
                     b_false.append(np.rad2deg(m["bearing_rad"]))
                 else:
@@ -659,7 +358,7 @@ def plot_harbour_debug(data, history):
             ax.scatter(t_true, b_true, s=8, label=f"{sensor} true")
 
         if len(t_false) > 0:
-            ax.scatter(t_false, b_false, s=2, label=f"{sensor} false", alpha=0.1, marker="x")
+            ax.scatter(t_false, b_false, s=2, alpha=0.1, marker="x", label=f"{sensor} false")
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Bearing [deg]")
@@ -682,7 +381,11 @@ def plot_harbour_debug(data, history):
     plt.show()
 
 
-def main(json_path, allowed_sensors=("radar", "camera", "ais"), show_plots=True):
+# -------------------------------------------------------------------------
+# Sequential tracker
+# -------------------------------------------------------------------------
+
+def run_sequential_tracker(json_path, allowed_sensors, init_sensors=("radar",), show_plots=False):
     data = load_json(json_path)
 
     measurements = data["measurements"]
@@ -690,7 +393,10 @@ def main(json_path, allowed_sensors=("radar", "camera", "ais"), show_plots=True)
 
     coord = CoordinateManager()
 
-    first_meas = first_valid_measurement(measurements, ("radar",))
+    try:
+        first_meas = first_valid_measurement(measurements, init_sensors)
+    except RuntimeError:
+        first_meas = first_valid_measurement(measurements, allowed_sensors)
 
     ekf = EKF()
 
@@ -714,16 +420,13 @@ def main(json_path, allowed_sensors=("radar", "camera", "ais"), show_plots=True)
         allowed_sensors=allowed_sensors,
     )
 
-    print("Finished tracking.")
+    print("Finished SEQUENTIAL tracking.")
     print("Number of updates:", len(history))
     print("Final state [N, E, vN, vE]:")
     print(ekf.x.flatten())
-
-    rmse = compute_rmse(data, history)
-    print("Position RMSE [m]:", rmse)
+    print("Position RMSE [m]:", compute_rmse(data, history))
 
     print_nis_consistency(tracker_ext)
-    print_success_criteria(data, history, allowed_sensors, tracker_ext)
 
     if show_plots:
         plot_harbour_debug(data, history)
@@ -732,8 +435,268 @@ def main(json_path, allowed_sensors=("radar", "camera", "ais"), show_plots=True)
     return tracker_ext
 
 
-if __name__ == "__main__":
-    compare_scenario_B_fusion()
+# -------------------------------------------------------------------------
+# Joint tracker for Scenario B
+# -------------------------------------------------------------------------
 
-    # Optional:
-    #compare_scenarios_A_B_C()
+def find_closest_camera_measurement(camera_measurements, radar_time, tolerance_s=1.0):
+    best_meas = None
+    best_dt = np.inf
+
+    for cam in camera_measurements:
+        dt = abs(cam["time"] - radar_time)
+
+        if dt < best_dt and dt <= tolerance_s:
+            best_meas = cam
+            best_dt = dt
+
+    return best_meas
+
+
+def run_scenario_B_joint(path, tolerance_s=1.0, show_plots=False):
+    data = load_json(path)
+    measurements = sorted(data["measurements"], key=lambda m: m["time"])
+
+    coord = CoordinateManager()
+
+    first_meas = first_valid_measurement(measurements, ("radar",))
+
+    ekf = EKF()
+
+    x0, P0, t0 = initial_state_from_measurement(
+        first_meas,
+        coordinate_manager=coord,
+    )
+
+    ekf.x = x0.reshape(4, 1)
+    ekf.P = P0
+    ekf.t = t0
+
+    tracker_ext = ExtendedTracker(
+        ekf=ekf,
+        coordinate_manager=coord,
+    )
+
+    radar_measurements = [
+        m for m in measurements
+        if m["sensor_id"].lower() == "radar" and not is_false_alarm(m)
+    ]
+
+    camera_measurements = [
+        m for m in measurements
+        if m["sensor_id"].lower() == "camera" and not is_false_alarm(m)
+    ]
+
+    used_camera_ids = set()
+
+    for radar_meas in radar_measurements:
+        if radar_meas["time"] < t0:
+            continue
+
+        cam_meas = find_closest_camera_measurement(
+            camera_measurements,
+            radar_meas["time"],
+            tolerance_s=tolerance_s,
+        )
+
+        if cam_meas is not None and id(cam_meas) not in used_camera_ids:
+            tracker_ext.update_joint_radar_camera(radar_meas, cam_meas)
+            used_camera_ids.add(id(cam_meas))
+        else:
+            tracker_ext.update_one(radar_meas)
+
+    print("Finished JOINT tracking.")
+    print("Number of updates:", len(tracker_ext.history))
+    print("Final state [N, E, vN, vE]:")
+    print(ekf.x.flatten())
+    print("Position RMSE [m]:", compute_rmse(data, tracker_ext.history))
+
+    print_nis_consistency(tracker_ext)
+
+    if show_plots:
+        plot_harbour_debug(data, tracker_ext.history)
+        plot_nis(tracker_ext)
+
+    return tracker_ext
+
+
+# -------------------------------------------------------------------------
+# Required validations
+# -------------------------------------------------------------------------
+
+def validate_T3_scenario_A():
+    print("\n" + "=" * 70)
+    print("T3 VALIDATION — SCENARIO A — RADAR ONLY")
+    print("=" * 70)
+
+    path = "harbour_sim_output/scenario_A.json"
+    data = load_json(path)
+
+    tracker = run_sequential_tracker(
+        path,
+        allowed_sensors=("radar",),
+        init_sensors=("radar",),
+        show_plots=False,
+    )
+
+    rmse = compute_rmse(data, tracker.history)
+    rmse_steady = compute_rmse_in_window(data, tracker.history, 30.0, data["t_end"])
+    nis = evaluate_nis_consistency(tracker)
+
+    print("\nT3 SUMMARY")
+    print(f"Overall RMSE: {rmse:.2f} m")
+    print(f"Steady-state RMSE from 30 s: {rmse_steady:.2f} m")
+    print(f"NIS inside bounds: {nis['percentage_inside']:.1f}%")
+
+    print_pass_fail("Steady-state RMSE < 12 m", rmse_steady < 12.0)
+    print_pass_fail("NIS >= 90%", nis["percentage_inside"] >= 90.0)
+
+    return tracker
+
+
+def validate_T4_scenario_B():
+    print("\n" + "=" * 70)
+    print("T4 VALIDATION — SCENARIO B — RADAR + CAMERA")
+    print("=" * 70)
+
+    path = "harbour_sim_output/scenario_B.json"
+    data = load_json(path)
+
+    print("\n--- Radar only baseline on Scenario B ---")
+    tracker_radar = run_sequential_tracker(
+        path,
+        allowed_sensors=("radar",),
+        init_sensors=("radar",),
+        show_plots=False,
+    )
+
+    print("\n--- Sequential radar + camera ---")
+    tracker_seq = run_sequential_tracker(
+        path,
+        allowed_sensors=("radar", "camera"),
+        init_sensors=("radar",),
+        show_plots=False,
+    )
+
+    print("\n--- Centralised / joint radar + camera ---")
+    tracker_joint = run_scenario_B_joint(
+        path,
+        tolerance_s=1.0,
+        show_plots=False,
+    )
+
+    rmse_radar = compute_rmse(data, tracker_radar.history)
+    rmse_seq = compute_rmse(data, tracker_seq.history)
+    rmse_joint = compute_rmse(data, tracker_joint.history)
+
+    nis_radar = evaluate_nis_consistency(tracker_radar)
+    nis_seq = evaluate_nis_consistency(tracker_seq)
+    nis_joint = evaluate_nis_consistency(tracker_joint)
+
+    improvement_seq = 100.0 * (rmse_radar - rmse_seq) / rmse_radar
+    improvement_joint = 100.0 * (rmse_radar - rmse_joint) / rmse_radar
+
+    print("\nT4 SUMMARY")
+    print(f"Radar-only RMSE: {rmse_radar:.2f} m")
+    print(f"Sequential RMSE: {rmse_seq:.2f} m")
+    print(f"Joint RMSE: {rmse_joint:.2f} m")
+    print(f"Sequential improvement: {improvement_seq:.1f}%")
+    print(f"Joint improvement: {improvement_joint:.1f}%")
+    print(f"Radar-only NIS: {nis_radar['percentage_inside']:.1f}%")
+    print(f"Sequential NIS: {nis_seq['percentage_inside']:.1f}%")
+    print(f"Joint NIS: {nis_joint['percentage_inside']:.1f}%")
+
+    print("\nPass/fail:")
+    print_pass_fail("Sequential fusion improves RMSE", rmse_seq < rmse_radar)
+    print_pass_fail("Joint fusion improves RMSE", rmse_joint < rmse_radar)
+    print_pass_fail("Sequential NIS >= 90%", nis_seq["percentage_inside"] >= 90.0)
+    print_pass_fail("Joint NIS >= 90%", nis_joint["percentage_inside"] >= 90.0)
+
+    print("\nBest RMSE architecture:")
+    if rmse_seq < rmse_joint:
+        print("Sequential update gives lower RMSE.")
+    else:
+        print("Centralised/joint update gives lower RMSE.")
+
+    return tracker_radar, tracker_seq, tracker_joint
+
+
+def validate_T5_scenario_C():
+    print("\n" + "=" * 70)
+    print("T5 VALIDATION — SCENARIO C — RADAR + CAMERA + AIS")
+    print("=" * 70)
+
+    path = "harbour_sim_output/scenario_C.json"
+    data = load_json(path)
+
+    print("\n--- Without AIS: radar + camera ---")
+    tracker_no_ais = run_sequential_tracker(
+        path,
+        allowed_sensors=("radar", "camera"),
+        init_sensors=("radar", "ais"),
+        show_plots=False,
+    )
+
+    print("\n--- With AIS: radar + camera + AIS ---")
+    tracker_with_ais = run_sequential_tracker(
+        path,
+        allowed_sensors=("radar", "camera", "ais"),
+        init_sensors=("radar", "ais"),
+        show_plots=False,
+    )
+
+    rmse_no_ais = compute_rmse(data, tracker_no_ais.history)
+    rmse_with_ais = compute_rmse(data, tracker_with_ais.history)
+
+    rmse_before = compute_rmse_in_window(data, tracker_with_ais.history, 0.0, 60.0)
+    rmse_dropout = compute_rmse_in_window(data, tracker_with_ais.history, 60.0, 90.0)
+    rmse_after = compute_rmse_in_window(data, tracker_with_ais.history, 90.0, data["t_end"])
+
+    updates_dropout = compute_update_count_in_window(tracker_with_ais.history, 60.0, 90.0)
+
+    nis_no_ais = evaluate_nis_consistency(tracker_no_ais)
+    nis_with_ais = evaluate_nis_consistency(tracker_with_ais)
+
+    improvement = 100.0 * (rmse_no_ais - rmse_with_ais) / rmse_no_ais
+
+    print("\nT5 SUMMARY")
+    print(f"Without AIS RMSE: {rmse_no_ais:.2f} m")
+    print(f"With AIS RMSE: {rmse_with_ais:.2f} m")
+    print(f"AIS improvement: {improvement:.1f}%")
+    print(f"RMSE before dropout 0-60 s: {rmse_before:.2f} m")
+    print(f"RMSE during dropout 60-90 s: {rmse_dropout:.2f} m")
+    print(f"RMSE after dropout 90-end s: {rmse_after:.2f} m")
+    print(f"Updates during dropout: {updates_dropout}")
+    print(f"NIS without AIS: {nis_no_ais['percentage_inside']:.1f}%")
+    print(f"NIS with AIS: {nis_with_ais['percentage_inside']:.1f}%")
+
+    print("\nPass/fail:")
+    print_pass_fail("AIS improves RMSE", rmse_with_ais < rmse_no_ais)
+    print_pass_fail("Track survives AIS dropout", updates_dropout > 0 and not np.isnan(rmse_dropout))
+    print_pass_fail("Smooth reacquisition after dropout", not np.isnan(rmse_after))
+    print_pass_fail("NIS with AIS >= 90%", nis_with_ais["percentage_inside"] >= 90.0)
+
+    return tracker_no_ais, tracker_with_ais
+
+
+def validate_all_required_tasks():
+    tracker_A = validate_T3_scenario_A()
+    tracker_B_radar, tracker_B_seq, tracker_B_joint = validate_T4_scenario_B()
+    tracker_C_no_ais, tracker_C_with_ais = validate_T5_scenario_C()
+
+    print("\n" + "=" * 70)
+    print("ALL REQUIRED VALIDATIONS FINISHED")
+    print("=" * 70)
+
+    return {
+        "T3_A": tracker_A,
+        "T4_B_radar": tracker_B_radar,
+        "T4_B_sequential": tracker_B_seq,
+        "T4_B_joint": tracker_B_joint,
+        "T5_C_no_ais": tracker_C_no_ais,
+        "T5_C_with_ais": tracker_C_with_ais,
+    }
+
+
+if __name__ == "__main__":
+    validate_all_required_tasks()
