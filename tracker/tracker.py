@@ -117,15 +117,16 @@ def plot_harbour_debug(data, history):
             
             color = "blue" if sensor == "radar" else "red"
             marker = "x" if is_false else "o"
-            alpha = 0.3 if is_false else 0.7
+            alpha = 0.1 if is_false else 0.7
+            size = 3 if is_false else 20
             label = f"{sensor} {'false' if is_false else 'true'}"
             
             # Only add to legend once per type
             if label not in legend_added:
-                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=20, label=label)
+                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=size, label=label)
                 legend_added.add(label)
             else:
-                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=20)
+                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=size)
 
     # Radar FOV
     radar_circle = plt.Circle(
@@ -187,7 +188,7 @@ def plot_harbour_debug(data, history):
         if len(t_true) > 0:
             ax.scatter(t_true, r_true, s=8, label=f"{sensor} (true)", color="blue" if sensor == "radar" else "red")
         if len(t_false) > 0:
-            ax.scatter(t_false, r_false, s=8, label=f"{sensor} (false)", alpha=0.3, marker="x", color="blue" if sensor == "radar" else "red")
+            ax.scatter(t_false, r_false, s=2, label=f"{sensor} (false)", alpha=0.1, marker="x", color="blue" if sensor == "radar" else "red")
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Range [m]")
@@ -220,7 +221,7 @@ def plot_harbour_debug(data, history):
         if len(t_true) > 0:
             ax.scatter(t_true, b_true, s=8, label=f"{sensor} (true)", color="blue" if sensor == "radar" else "red")
         if len(t_false) > 0:
-            ax.scatter(t_false, b_false, s=8, label=f"{sensor} (false)", alpha=0.3, marker="x", color="blue" if sensor == "radar" else "red")
+            ax.scatter(t_false, b_false, s=2, label=f"{sensor} (false)", alpha=0.1, marker="x", color="blue" if sensor == "radar" else "red")
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Bearing [deg]")
@@ -254,7 +255,7 @@ def main(json_path, allowed_sensors=("radar", "camera", "ais")):
 
     coord = CoordinateManager()
 
-    first_meas = first_valid_measurement(measurements, allowed_sensors)
+    first_meas = first_valid_measurement(measurements, ("radar",))
 
     ekf = EKF()
 
@@ -298,16 +299,16 @@ if __name__ == "__main__":
     #     allowed_sensors=("radar",),
     # )
 
-    # Scenario B: radar + camera
-    #
-    tracker = main(
-        "harbour_sim_output/scenario_B.json",
-        allowed_sensors=("radar", "camera"),
-    )
+    # # Scenario B: radar + camera
+    # #
+    # tracker = main(
+    #     "harbour_sim_output/scenario_B.json",
+    #     allowed_sensors=("radar", "camera"),
+    # )
 
     # Scenario C: radar + camera + AIS
     #
-    # tracker = main(
-    #     "harbour_sim_output/scenario_C.json",
-    #     allowed_sensors=("radar", "camera", "ais"),
-    # )
+    tracker = main(
+        "harbour_sim_output/scenario_C.json",
+        allowed_sensors=("radar", "camera", "ais"),
+    )

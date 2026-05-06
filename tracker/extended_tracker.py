@@ -9,37 +9,6 @@ This file does NOT implement:
 
 It only connects:
     EKF + CoordinateManager + sensor measurements
-
-Expected EKF interface:
-    ekf.x
-    ekf.P
-    ekf.t
-    ekf.predict_to(t)
-    ekf.update(z, z_pred, H, R)
-
-Expected CoordinateManager interface:
-    coord.sensor_position(sensor_id, vessel_pos=None)
-    coord.h_range_bearing(x, sensor_pos)
-    coord.H_range_bearing(x, sensor_pos)
-    coord.R(sensor_id, x_pred=None, vessel_pos=None)
-
-Use like this:
-
-from extended_tracker import ExtendedTracker
-from coordinate_manager import CoordinateManager
-
-coord = CoordinateManager()
-
-tracker_ext = ExtendedTracker(
-    ekf=my_ekf,
-    coordinate_manager=coord
-)
-
-tracker_ext.process_measurements_sequential(
-    measurements,
-    vessel_positions=vessel_positions,
-    allowed_sensors=("radar", "camera", "ais")
-)
 """
 
 from __future__ import annotations
@@ -98,9 +67,7 @@ def closest_vessel_position(
         return None
 
     if arr.ndim != 2 or arr.shape[1] < 3:
-        raise ValueError(
-            "vessel_positions must have format [[time, N, E], ...]"
-        )
+        raise ValueError("vessel_positions must have format [[time, N, E], ...]")
 
     idx = int(np.argmin(np.abs(arr[:, 0] - float(time_s))))
     return arr[idx, 1:3]
@@ -112,10 +79,11 @@ def closest_vessel_position(
 
 class ExtendedTracker:
     """
-    It assumes one EKF track already exists.
+    Fusion layer for T4 and T5.
 
-    For T6/T7, this same class can be used inside each track object after data
-    association chooses which measurement belongs to that track.
+    This is still single-target.
+    For T6, false alarms should be handled properly with gating and association.
+    For now, false alarms are ignored using true_target_id == -1.
     """
 
     def __init__(
@@ -147,12 +115,6 @@ class ExtendedTracker:
 
             predict to measurement time
             update using that sensor
-
-        For Scenario B:
-            allowed_sensors=("radar", "camera")
-
-        For Scenario C:
-            allowed_sensors=("radar", "camera", "ais")
         """
         allowed = {s.lower() for s in allowed_sensors}
 
@@ -170,6 +132,9 @@ class ExtendedTracker:
             if sensor_id == "gnss":
                 continue
 
+            # IMPORTANT:
+            # For T4/T5 single-target validation, skip simulator false alarms.
+            # Later in T6 this must be replaced by gating + data association.
             if ignore_false_alarms and self._is_false_alarm(meas):
                 continue
 
@@ -240,6 +205,10 @@ class ExtendedTracker:
 
         Use only when radar and camera measurements are considered simultaneous.
         """
+        # Do not use false alarms in this temporary single-target version.
+        if self._is_false_alarm(radar_meas) or self._is_false_alarm(camera_meas):
+            return None
+
         radar_time = self._measurement_time(radar_meas)
         camera_time = self._measurement_time(camera_meas)
 
@@ -407,11 +376,10 @@ class ExtendedTracker:
 
         Expected EKF interface:
             ekf.update(z, z_pred, H, R)
-
-        If your teammate's EKF is different, change only this function.
         """
         innovation = np.asarray(z, dtype=float) - np.asarray(z_pred, dtype=float)
 
+        # Wrap every bearing component: 1, 3, 5, ...
         for k in range(1, len(innovation), 2):
             innovation[k] = wrap_angle(innovation[k])
 
@@ -436,26 +404,32 @@ class ExtendedTracker:
 
     @staticmethod
     def _sensor_id(meas: Dict[str, Any]) -> str:
-        return str(
-            meas.get("sensor_id", meas.get("sensor", ""))
-        ).lower()
+        return str(meas.get("sensor_id", meas.get("sensor", ""))).lower()
 
     @staticmethod
     def _measurement_time(meas: Dict[str, Any]) -> float:
-        return float(
-            meas.get("time", meas.get("timestamp", meas.get("t", 0.0)))
-        )
+        return float(meas.get("time", meas.get("timestamp", meas.get("t", 0.0))))
 
     @staticmethod
     def _is_false_alarm(meas: Dict[str, Any]) -> bool:
-        if "is_false_alarm" in meas:
-            return bool(meas["is_false_alarm"])
+        """
+        Detect simulator false alarms.
 
+        Simulator convention:
+            true_target_id == -1 means false alarm.
+
+        Some versions may use:
+            target_id == -1
+            is_false_alarm == True
+        """
         if "true_target_id" in meas:
             return int(meas["true_target_id"]) == -1
 
         if "target_id" in meas:
             return int(meas["target_id"]) == -1
+
+        if "is_false_alarm" in meas:
+            return bool(meas["is_false_alarm"])
 
         return False
 
@@ -485,18 +459,11 @@ def initial_state_from_measurement(
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Build x0, P0, t0 from radar, camera, or AIS measurement.
-
-    Use this only if tracker.py needs a simple way to create the first EKF state.
     """
     coord = coordinate_manager
 
-    sensor_id = str(
-        meas.get("sensor_id", meas.get("sensor", ""))
-    ).lower()
-
-    time_s = float(
-        meas.get("time", meas.get("timestamp", meas.get("t", 0.0)))
-    )
+    sensor_id = str(meas.get("sensor_id", meas.get("sensor", ""))).lower()
+    time_s = float(meas.get("time", meas.get("timestamp", meas.get("t", 0.0))))
 
     if sensor_id in ("radar", "camera"):
         sensor_pos = coord.sensor_position(sensor_id)
