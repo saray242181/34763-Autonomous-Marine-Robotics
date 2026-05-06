@@ -47,28 +47,31 @@ def get_first_ground_truth(data):
     target_id = list(gt.keys())[0]
     truth = np.asarray(gt[target_id], dtype=float)
 
-    gt_N = truth[:, 0]
-    gt_E = truth[:, 1]
+    gt_time = truth[:, 0]
+    gt_N = truth[:, 1]
+    gt_E = truth[:, 2]
 
     valid = ~np.isnan(gt_N)
 
-    return gt_N, gt_E, valid, target_id
+    return gt_time, gt_N, gt_E, valid, target_id
 
 
 def compute_rmse(data, history):
-    _, est_N, est_E = extract_estimates(history)
+    times, est_N, est_E = extract_estimates(history)
 
-    gt_N, gt_E, valid, _ = get_first_ground_truth(data)
+    gt_time, gt_N, gt_E, valid, _ = get_first_ground_truth(data)
 
-    n = min(len(est_N), np.sum(valid))
+    gt_time_valid = gt_time[valid]
+    gt_N_valid = gt_N[valid]
+    gt_E_valid = gt_E[valid]
 
-    if n == 0:
-        return np.nan
+    gt_N_interp = np.interp(times, gt_time_valid, gt_N_valid)
+    gt_E_interp = np.interp(times, gt_time_valid, gt_E_valid)
 
     rmse = np.sqrt(
         np.mean(
-            (est_N[:n] - gt_N[valid][:n]) ** 2
-            + (est_E[:n] - gt_E[valid][:n]) ** 2
+            (est_N - gt_N_interp) ** 2
+            + (est_E - gt_E_interp) ** 2
         )
     )
 
@@ -79,7 +82,7 @@ def plot_harbour_debug(data, history):
     measurements = data["measurements"]
 
     times, est_N, est_E = extract_estimates(history)
-    gt_N, gt_E, valid, target_id = get_first_ground_truth(data)
+    gt_time, gt_N, gt_E, valid, target_id = get_first_ground_truth(data)
 
     fig, axs = plt.subplots(2, 2, figsize=(14, 9))
     fig.suptitle("Harbour Surveillance Tracking Result")
@@ -91,6 +94,38 @@ def plot_harbour_debug(data, history):
 
     ax.plot(gt_E[valid], gt_N[valid], label=f"Ground Truth Target {target_id}")
     ax.plot(est_E, est_N, label="EKF Track")
+
+    # Plot sensor measurements
+    legend_added = set()
+    for m in measurements:
+        sensor = m["sensor_id"].lower()
+        is_false = (m.get("is_false_alarm", False) or 
+                   m.get("true_target_id", m.get("target_id", 0)) == -1)
+        
+        if sensor in ["radar", "camera"] and "range_m" in m and "bearing_rad" in m:
+            # Convert polar to cartesian
+            r = m["range_m"]
+            theta = m["bearing_rad"]
+            if sensor == "radar":
+                x = r * np.sin(theta)  # East
+                y = r * np.cos(theta)  # North
+            elif sensor == "camera":
+                # Camera position
+                cam_n, cam_e = -80.0, 120.0
+                x = cam_e + r * np.sin(theta)
+                y = cam_n + r * np.cos(theta)
+            
+            color = "blue" if sensor == "radar" else "red"
+            marker = "x" if is_false else "o"
+            alpha = 0.3 if is_false else 0.7
+            label = f"{sensor} {'false' if is_false else 'true'}"
+            
+            # Only add to legend once per type
+            if label not in legend_added:
+                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=20, label=label)
+                legend_added.add(label)
+            else:
+                ax.scatter(x, y, marker=marker, alpha=alpha, color=color, s=20)
 
     # Radar FOV
     radar_circle = plt.Circle(
@@ -133,16 +168,26 @@ def plot_harbour_debug(data, history):
     ax = axs[0, 1]
 
     for sensor in ["radar", "camera"]:
-        t = []
-        r = []
+        t_true = []
+        r_true = []
+        t_false = []
+        r_false = []
 
         for m in measurements:
             if m["sensor_id"].lower() == sensor and "range_m" in m:
-                t.append(m["time"])
-                r.append(m["range_m"])
+                is_false = (m.get("is_false_alarm", False) or 
+                           m.get("true_target_id", m.get("target_id", 0)) == -1)
+                if is_false:
+                    t_false.append(m["time"])
+                    r_false.append(m["range_m"])
+                else:
+                    t_true.append(m["time"])
+                    r_true.append(m["range_m"])
 
-        if len(t) > 0:
-            ax.scatter(t, r, s=8, label=sensor)
+        if len(t_true) > 0:
+            ax.scatter(t_true, r_true, s=8, label=f"{sensor} (true)", color="blue" if sensor == "radar" else "red")
+        if len(t_false) > 0:
+            ax.scatter(t_false, r_false, s=8, label=f"{sensor} (false)", alpha=0.3, marker="x", color="blue" if sensor == "radar" else "red")
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Range [m]")
@@ -156,16 +201,26 @@ def plot_harbour_debug(data, history):
     ax = axs[1, 0]
 
     for sensor in ["radar", "camera"]:
-        t = []
-        b = []
+        t_true = []
+        b_true = []
+        t_false = []
+        b_false = []
 
         for m in measurements:
             if m["sensor_id"].lower() == sensor and "bearing_rad" in m:
-                t.append(m["time"])
-                b.append(np.rad2deg(m["bearing_rad"]))
+                is_false = (m.get("is_false_alarm", False) or 
+                           m.get("true_target_id", m.get("target_id", 0)) == -1)
+                if is_false:
+                    t_false.append(m["time"])
+                    b_false.append(np.rad2deg(m["bearing_rad"]))
+                else:
+                    t_true.append(m["time"])
+                    b_true.append(np.rad2deg(m["bearing_rad"]))
 
-        if len(t) > 0:
-            ax.scatter(t, b, s=8, label=sensor)
+        if len(t_true) > 0:
+            ax.scatter(t_true, b_true, s=8, label=f"{sensor} (true)", color="blue" if sensor == "radar" else "red")
+        if len(t_false) > 0:
+            ax.scatter(t_false, b_false, s=8, label=f"{sensor} (false)", alpha=0.3, marker="x", color="blue" if sensor == "radar" else "red")
 
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Bearing [deg]")
@@ -238,17 +293,17 @@ def main(json_path, allowed_sensors=("radar", "camera", "ais")):
 
 if __name__ == "__main__":
     # Scenario A: radar only
-    tracker = main(
-        "harbour_sim_output/scenario_A.json",
-        allowed_sensors=("radar",),
-    )
+    # tracker = main(
+    #     "harbour_sim_output/scenario_A.json",
+    #     allowed_sensors=("radar",),
+    # )
 
     # Scenario B: radar + camera
     #
-    # tracker = main(
-    #     "harbour_sim_output/scenario_B.json",
-    #     allowed_sensors=("radar", "camera"),
-    # )
+    tracker = main(
+        "harbour_sim_output/scenario_B.json",
+        allowed_sensors=("radar", "camera"),
+    )
 
     # Scenario C: radar + camera + AIS
     #
