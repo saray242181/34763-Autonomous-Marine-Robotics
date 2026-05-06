@@ -51,8 +51,12 @@ _DOF_MEAS       = 2
 GATE_THRESHOLD: float = float(chi2.ppf(_GATE_PROB, df=_DOF_MEAS))   # ≈ 9.21
 
 # --- T7: Track lifecycle ---
-M_CONFIRM: int   = 3     # minimum hits inside window to confirm a tentative track
-N_WINDOW:  int   = 5     # sliding history window length (scans)
+M_CONFIRM: int   = 2     # minimum hits inside window to confirm a tentative track
+N_WINDOW:  int   = 9     # sliding history window length (scans); set to 9 so that
+                         # radar-only targets (camera fires between radar scans and
+                         # always misses out-of-FOV targets) accumulate 3 hits in the
+                         # window before K_DEL fires.  Pattern M,M,H,M,H,M,M,H,M has
+                         # sum=3 at call 8 — N_WINDOW=5 would never reach sum=3.
 K_DEL:     int   = 5     # consecutive misses before a track is deleted
 MAX_SPEED: float = 15.0  # m/s — hard vessel speed cap for 2-point initiation
 
@@ -297,9 +301,13 @@ class MultiTargetTracker:
     def __init__(self, coordinate_manager: Any) -> None:
         self.coord = coordinate_manager
 
-        self.active_tracks:             List[Track]           = []
-        self.unassigned_detections:     List[Dict[str, Any]]  = []
-        self.prev_unassigned_detections: List[Dict[str, Any]] = []
+        self.active_tracks:          List[Track]                     = []
+        self.unassigned_detections:  List[Dict[str, Any]]           = []
+        # Per-sensor rolling buffers: sensor_id → unmatched dets from last scan
+        # of that sensor.  Using separate per-sensor buffers prevents a fast
+        # sensor from overwriting the previous buffer of a slow sensor before
+        # 2-point initiation can pair them.
+        self._prev_by_sensor:        Dict[str, List[Dict[str, Any]]] = {}
 
         # Auto-increments for internally spawned tracks.
         # add_track() keeps this consistent with externally assigned IDs.
@@ -410,7 +418,7 @@ class MultiTargetTracker:
             self.unassigned_detections.append(valid_measurements[det_idx])
 
         # Step 6 — T7 lifecycle
-        self._manage_track_lifecycle(scan_time)
+        self._manage_track_lifecycle(scan_time, sensor_id)
 
         self.scan_history.append({
             "time": scan_time,
@@ -424,15 +432,17 @@ class MultiTargetTracker:
     # T7: Track lifecycle manager
     # ------------------------------------------------------------------
 
-    def _manage_track_lifecycle(self, current_time_s: float) -> None:
+    def _manage_track_lifecycle(self, current_time_s: float, sensor_id: str) -> None:
         """
         Run the four-phase T7 lifecycle update at the end of every scan.
 
         Phase 1 — 2-Point Track Initiation
             Pair unmatched detections from the current scan against those
-            from the previous scan.  If a pair implies a plausible vessel
-            speed (< MAX_SPEED m/s), spawn a new tentative Track using a
-            finite-difference velocity estimate.
+            from the *same sensor's* previous scan (self._prev_by_sensor).
+            Using per-sensor buffers prevents a fast sensor from overwriting
+            slow-sensor detections before 2-point initiation can pair them.
+            If a pair implies a plausible vessel speed (< MAX_SPEED m/s),
+            spawn a new tentative Track using a finite-difference velocity.
 
         Phase 2 — Track Merging
             For every unique pair of confirmed tracks, compute the
@@ -445,10 +455,12 @@ class MultiTargetTracker:
             self.active_tracks.
 
         Phase 4 — Rotate Unassigned Buffers
-            Move self.unassigned_detections → self.prev_unassigned_detections.
-            Clear self.unassigned_detections for the next scan.
+            Store remaining self.unassigned_detections into
+            self._prev_by_sensor[sensor_id] for the next scan of this sensor.
+            Clear self.unassigned_detections for the next call.
         """
         # ── Phase 1: 2-point track initiation ─────────────────────────────
+        prev_list = self._prev_by_sensor.get(sensor_id, [])
         spawned_prev_idx: Set[int] = set()
         spawned_curr_idx: Set[int] = set()
 
@@ -461,7 +473,7 @@ class MultiTargetTracker:
                 continue
             t_curr = float(curr_meas.get("time", current_time_s))
 
-            for i, prev_meas in enumerate(self.prev_unassigned_detections):
+            for i, prev_meas in enumerate(prev_list):
                 if i in spawned_prev_idx:
                     continue
 
@@ -486,16 +498,26 @@ class MultiTargetTracker:
                 vE = (pos_curr[1] - pos_prev[1]) / dt
 
                 sid = str(curr_meas.get("sensor_id", "radar")).lower()
-                # R is 2×2 in measurement space; used as proxy for position
-                # and velocity uncertainty per the T7 specification.
+                # Build P0 in NED state space.  R is in (range, bearing) space,
+                # so using it directly gives ~0.005 m position variance in the
+                # bearing direction (bearing noise ≈ 0.005 rad treated as metres).
+                # Instead, project R through the Jacobian inverse to get correct
+                # NED position covariance.
                 try:
-                    R_sensor = self.coord.R(sid)
-                except (ValueError, KeyError):
-                    R_sensor = np.diag([25.0, 25.0])  # 5 m fallback
+                    R_sensor    = self.coord.R(sid)
+                    x_init      = np.array([[pos_curr[0]], [pos_curr[1]], [vN], [vE]])
+                    sensor_pos_ned = self.coord.sensor_position(sid)
+                    H_pos       = self.coord.H_range_bearing(x_init, sensor_pos_ned)[:, :2]
+                    H_pos_inv   = np.linalg.inv(H_pos)
+                    P_pos       = H_pos_inv @ R_sensor @ H_pos_inv.T
+                except (ValueError, KeyError, np.linalg.LinAlgError):
+                    P_pos = np.diag([2500.0, 2500.0])  # 50 m fallback
+
+                P_vel = P_pos / dt**2
 
                 P0 = np.block([
-                    [R_sensor,           np.zeros((2, 2))   ],
-                    [np.zeros((2, 2)),   R_sensor / dt**2   ],
+                    [P_pos,             np.zeros((2, 2))   ],
+                    [np.zeros((2, 2)),  P_vel              ],
                 ])
 
                 new_ekf   = EKF()
@@ -516,11 +538,7 @@ class MultiTargetTracker:
                 spawned_curr_idx.add(j)
                 break  # each current detection spawns at most one track
 
-        # Remove consumed detections from the unassigned lists
-        self.prev_unassigned_detections = [
-            m for i, m in enumerate(self.prev_unassigned_detections)
-            if i not in spawned_prev_idx
-        ]
+        # Remove consumed detections
         self.unassigned_detections = [
             m for j, m in enumerate(self.unassigned_detections)
             if j not in spawned_curr_idx
@@ -565,8 +583,8 @@ class MultiTargetTracker:
         self.active_tracks = [t for t in self.active_tracks
                               if t.state != "deleted"]
 
-        # ── Phase 4: rotate unassigned detection buffers ───────────────────
-        self.prev_unassigned_detections = list(self.unassigned_detections)
+        # ── Phase 4: rotate per-sensor unassigned buffer ──────────────────
+        self._prev_by_sensor[sensor_id] = list(self.unassigned_detections)
         self.unassigned_detections      = []
 
     # ------------------------------------------------------------------
@@ -618,8 +636,10 @@ class MultiTargetTracker:
         ]
         for t in self.active_tracks:
             lines.append(f"  {t}")
+        total_prev = sum(len(v) for v in self._prev_by_sensor.values())
         lines.append(
-            f"  Prev-unassigned buffer: {len(self.prev_unassigned_detections)}"
+            f"  Prev-unassigned buffers: {total_prev} total "
+            f"({', '.join(f'{k}:{len(v)}' for k, v in sorted(self._prev_by_sensor.items()))})"
         )
         return "\n".join(lines)
 
@@ -704,9 +724,9 @@ if __name__ == "__main__":
              "is_false_alarm": False, "target_id": -1}
     mtt.process_scan(0.0, "radar", [det1], vessel_pos=None)
     assert len(mtt.active_tracks) == 0         # not yet paired
-    assert len(mtt.prev_unassigned_detections) == 1
+    assert len(mtt._prev_by_sensor.get("radar", [])) == 1
     print(f"After scan 1: active={len(mtt.active_tracks)}, "
-          f"prev_buf={len(mtt.prev_unassigned_detections)} ✓")
+          f"prev_buf={len(mtt._prev_by_sensor.get('radar', []))} ✓")
 
     # Scan 2: same target has moved ~5 m in 3.33 s (≈ 1.5 m/s < 15 m/s)
     import math as _math
@@ -741,7 +761,7 @@ if __name__ == "__main__":
         tr.hit_streak = 5 if tid == 10 else 3
 
     assert len(mtt2.active_tracks) == 2
-    mtt2._manage_track_lifecycle(0.0)
+    mtt2._manage_track_lifecycle(0.0, "radar")
     assert len(mtt2.active_tracks) == 1, \
         f"Expected merge to 1 track, got {len(mtt2.active_tracks)}"
     survivor = mtt2.active_tracks[0]

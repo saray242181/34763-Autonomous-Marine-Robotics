@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
@@ -9,6 +10,7 @@ MOTP_REJECT_THRESHOLD = 50.0  # metres — reject matched pairs beyond this
 def evaluate_tracker_performance(
     ground_truth: dict,
     tracker_history: list,
+    scenario_name: str = "",
 ) -> tuple[float, float]:
     """
     Computes and plots MOTP and CE metrics over time.
@@ -120,6 +122,10 @@ def evaluate_tracker_performance(
     ax_ce.legend()
 
     plt.tight_layout()
+    if scenario_name:
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harbour_sim_output")
+        fig.savefig(os.path.join(out_dir, f"scenario_{scenario_name}_metrics.png"), dpi=150)
+        print(f"Metrics plot saved → harbour_sim_output/scenario_{scenario_name}_metrics.png")
     plt.show()
 
     return mean_motp, mean_ce

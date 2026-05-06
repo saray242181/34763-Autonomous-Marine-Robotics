@@ -106,7 +106,7 @@ def run_scenario(
     print(f"\n=== Scenario {scenario_name} — final tracker state ===")
     print(mtt.summary())
 
-    motp, ce = evaluate_tracker_performance(data["ground_truth"], mtt.scan_history)
+    motp, ce = evaluate_tracker_performance(data["ground_truth"], mtt.scan_history, scenario_name=scenario_name)
     print(f"\nScenario {scenario_name}  |  MOTP: {motp:.2f} m  |  Mean CE: {ce:.3f}")
 
     return mtt, data
@@ -180,6 +180,9 @@ def plot_multi_target_ned(
     ax.grid(True)
     ax.legend(fontsize=8, ncol=2, loc="upper right")
     plt.tight_layout()
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harbour_sim_output")
+    fig.savefig(os.path.join(out_dir, f"scenario_{scenario_name}_tracks.png"), dpi=150)
+    print(f"Track plot saved → harbour_sim_output/scenario_{scenario_name}_tracks.png")
     plt.show()
 
 

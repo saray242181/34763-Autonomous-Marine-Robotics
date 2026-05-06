@@ -42,6 +42,34 @@ CAMERA_ROTATION_DEG =  28.0   # camera frame → NED
 SIGMA_GNSS_POS = 6.0   # m
 SIGMA_AIS_POS  = 6.0   # m
 
+# GPS position of the NED origin (= radar position), from data/README.md
+_LAT0_DEG = 55.69014690
+_LON0_DEG = 12.59998830
+
+
+# ---------------------------------------------------------------------------
+# Coordinate conversion helpers (NED metres → Web Mercator for map overlay)
+# ---------------------------------------------------------------------------
+
+def _ned_to_latlon(N: float, E: float) -> Tuple[float, float]:
+    """Flat-Earth NED metres → (lat_deg, lon_deg). Accurate to < 1 m within 10 km."""
+    R = 6_371_000.0
+    lat = _LAT0_DEG + math.degrees(N / R)
+    lon = _LON0_DEG + math.degrees(E / (R * math.cos(math.radians(_LAT0_DEG))))
+    return lat, lon
+
+
+def _latlon_to_webmerc(lat: float, lon: float) -> Tuple[float, float]:
+    """WGS84 (lat_deg, lon_deg) → Web Mercator (x, y) in metres (EPSG:3857)."""
+    x = math.radians(lon) * 6_378_137.0
+    y = math.log(math.tan(math.pi / 4.0 + math.radians(lat) / 2.0)) * 6_378_137.0
+    return x, y
+
+
+def _ned_to_wm(N: float, E: float) -> Tuple[float, float]:
+    """NED metres → Web Mercator (x, y)."""
+    return _latlon_to_webmerc(*_ned_to_latlon(N, E))
+
 
 # ---------------------------------------------------------------------------
 # CSV loaders
@@ -200,16 +228,21 @@ def compute_ais_rmse(
     ais_measurements: List[Dict],
 ) -> None:
     """
-    Treat AIS reports as pseudo-ground-truth and compute per-AIS-ID RMSE
+    Treat AIS reports as pseudo-ground-truth and compute per-MMSI RMSE
     against the nearest confirmed/coasting track at each AIS timestamp.
+
+    Groups by MMSI (persistent ship identifier) rather than ais_id, because
+    ais_id is a local ephemeral label that may be reassigned to different
+    physical ships within the same dataset.
 
     This is an approximation: AIS σ=6 m, so RMSE < 6 m is indistinguishable
     from sensor noise.
     """
-    # Build AIS time-series per ais_id
-    ais_by_id: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
+    # Group by MMSI (persistent); fall back to ais_id if mmsi absent
+    ais_by_mmsi: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
     for m in ais_measurements:
-        ais_by_id[m["ais_id"]].append(
+        key = str(m.get("mmsi", m.get("ais_id", "unknown")))
+        ais_by_mmsi[key].append(
             (float(m["time"]), float(m["north_m"]), float(m["east_m"]))
         )
 
@@ -227,11 +260,10 @@ def compute_ais_rmse(
 
     snap_times = np.array(sorted(history_by_time.keys()))
 
-    print("\n=== AIS pseudo-GT RMSE ===")
-    for ais_id, reports in sorted(ais_by_id.items()):
+    print("\n=== AIS pseudo-GT RMSE (grouped by MMSI) ===")
+    for mmsi, reports in sorted(ais_by_mmsi.items()):
         errors = []
         for t_ais, n_ais, e_ais in reports:
-            # Find the closest scan time
             idx = int(np.argmin(np.abs(snap_times - t_ais)))
             t_snap = snap_times[idx]
             if abs(t_snap - t_ais) > 5.0:
@@ -245,10 +277,10 @@ def compute_ais_rmse(
 
         if errors:
             rmse = float(np.sqrt(np.mean(np.array(errors) ** 2)))
-            print(f"  AIS id={ais_id}: {len(errors)} comparisons, "
+            print(f"  MMSI={mmsi}: {len(errors)} comparisons, "
                   f"RMSE = {rmse:.2f} m  (AIS σ=6 m)")
         else:
-            print(f"  AIS id={ais_id}: no overlapping scan times found")
+            print(f"  MMSI={mmsi}: no overlapping scan times found")
 
 
 def print_cardinality_summary(mtt: MultiTargetTracker) -> None:
@@ -278,11 +310,17 @@ def plot_real_tracks(
     all_meas: List[Dict],
 ) -> None:
     """
-    2-D NED trajectory plot:
-      - Confirmed + coasting track paths (dashed)
+    Trajectory plot overlaid on a satellite map of Copenhagen harbour.
+
+    All NED coordinates are converted to Web Mercator (EPSG:3857) so that
+    contextily can add ESRI WorldImagery tiles as a background.
+
+    Layers (bottom to top):
+      - Satellite basemap
       - Sensor measurement back-projections (low-alpha scatter)
       - AIS positions (crosses)
       - Vessel GNSS path
+      - Confirmed + coasting track paths (dashed)
       - Sensor position markers
     """
     coord = CoordinateManager()
@@ -291,10 +329,9 @@ def plot_real_tracks(
     fig, ax = plt.subplots(figsize=(14, 12))
 
     # Vessel GNSS path
-    ax.plot(
-        vessel_positions[:, 2], vessel_positions[:, 1],
-        color="gray", linewidth=0.8, alpha=0.5, label="Vessel (GNSS)", zorder=2,
-    )
+    vx = [_ned_to_wm(N, E)[0] for N, E in zip(vessel_positions[:, 1], vessel_positions[:, 2])]
+    vy = [_ned_to_wm(N, E)[1] for N, E in zip(vessel_positions[:, 1], vessel_positions[:, 2])]
+    ax.plot(vx, vy, color="gray", linewidth=0.8, alpha=0.5, label="Vessel (GNSS)", zorder=2)
 
     # Confirmed + coasting track trajectories
     track_traj: Dict[int, List] = defaultdict(list)
@@ -304,12 +341,11 @@ def plot_real_tracks(
                 track_traj[tr["id"]].append(tr["pos"])
 
     for i, (tid, positions) in enumerate(track_traj.items()):
-        pts = np.array(positions)
-        ax.plot(
-            pts[:, 1], pts[:, 0],
-            "--", color=colors[i % 10], linewidth=1.5,
-            label=f"Track {tid}", zorder=5,
-        )
+        wm = [_ned_to_wm(p[0], p[1]) for p in positions]
+        xs = [p[0] for p in wm]
+        ys = [p[1] for p in wm]
+        ax.plot(xs, ys, "--", color=colors[i % 10], linewidth=1.5,
+                label=f"Track {tid}", zorder=5)
 
     # Sensor measurement scatter
     cam_pos = coord.sensor_position("camera")
@@ -320,8 +356,9 @@ def plot_real_tracks(
             b = float(m["bearing_rad"])
             sensor_pos = coord.sensor_position(sid)
             ne = sensor_pos + np.array([r * math.cos(b), r * math.sin(b)])
+            wx, wy = _ned_to_wm(float(ne[0]), float(ne[1]))
             color = "steelblue" if sid == "radar" else "tomato"
-            ax.scatter(ne[1], ne[0], s=4, color=color, alpha=0.08, zorder=1)
+            ax.scatter(wx, wy, s=4, color=color, alpha=0.08, zorder=1)
 
     # AIS reports
     ais_by_id: Dict[str, List] = defaultdict(list)
@@ -329,26 +366,36 @@ def plot_real_tracks(
         if m["sensor_id"].lower() == "ais":
             ais_by_id[m["ais_id"]].append([float(m["north_m"]), float(m["east_m"])])
     for j, (aid, pts) in enumerate(sorted(ais_by_id.items())):
-        pts_arr = np.array(pts)
-        ax.scatter(
-            pts_arr[:, 1], pts_arr[:, 0],
-            marker="x", s=15, linewidths=0.8,
-            color=colors[j % 10], alpha=0.6, label=f"AIS id={aid}", zorder=3,
-        )
+        wm = [_ned_to_wm(p[0], p[1]) for p in pts]
+        xs = [p[0] for p in wm]
+        ys = [p[1] for p in wm]
+        ax.scatter(xs, ys, marker="x", s=15, linewidths=0.8,
+                   color=colors[j % 10], alpha=0.6, label=f"AIS id={aid}", zorder=3)
 
     # Sensor markers
-    ax.scatter(0, 0, marker="^", s=120, color="black", zorder=6, label="Radar [0,0]")
-    ax.scatter(
-        cam_pos[1], cam_pos[0],
-        marker="s", s=120, color="purple", zorder=6,
-        label=f"Camera [{cam_pos[0]:.0f},{cam_pos[1]:.0f}]",
-    )
+    rx, ry = _ned_to_wm(0.0, 0.0)
+    ax.scatter(rx, ry, marker="^", s=120, color="black", zorder=6, label="Radar [0,0]")
+    cx, cy = _ned_to_wm(float(cam_pos[0]), float(cam_pos[1]))
+    ax.scatter(cx, cy, marker="s", s=120, color="purple", zorder=6,
+               label=f"Camera [{cam_pos[0]:.0f},{cam_pos[1]:.0f}]")
 
-    ax.set_xlabel("East [m]")
-    ax.set_ylabel("North [m]")
-    ax.set_title("Phase 4 — Real Data: Confirmed Track Trajectories (NED)")
-    ax.axis("equal")
-    ax.grid(True)
+    # Satellite basemap
+    try:
+        import contextily as ctx
+        ctx.add_basemap(
+            ax,
+            source=ctx.providers.Esri.WorldImagery,
+            zoom=15,
+            attribution_size=6,
+        )
+    except Exception as exc:
+        print(f"  [warning] Satellite basemap unavailable ({exc}); using plain grid.")
+        ax.set_aspect("equal")
+
+    ax.set_xlabel("Easting (Web Mercator, m)")
+    ax.set_ylabel("Northing (Web Mercator, m)")
+    ax.set_title("Phase 4 — Real Data: Confirmed Track Trajectories (Copenhagen Harbour)")
+    ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, ncol=2, loc="upper right")
     plt.tight_layout()
     plt.savefig(
