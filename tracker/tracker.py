@@ -1,6 +1,9 @@
 import json
+import os
 import numpy as np
 import matplotlib.pyplot as plt
+
+_SCENARIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "harbour_sim_output")
 
 from ekf import EKF
 from coordinate_manager import CoordinateManager
@@ -529,7 +532,7 @@ def validate_T3_scenario_A():
     print("T3 VALIDATION — SCENARIO A — RADAR ONLY")
     print("=" * 70)
 
-    path = "harbour_sim_output/scenario_A.json"
+    path = os.path.join(_SCENARIO_DIR, "scenario_A.json")
     data = load_json(path)
 
     tracker = run_sequential_tracker(
@@ -559,7 +562,7 @@ def validate_T4_scenario_B():
     print("T4 VALIDATION — SCENARIO B — RADAR + CAMERA")
     print("=" * 70)
 
-    path = "harbour_sim_output/scenario_B.json"
+    path = os.path.join(_SCENARIO_DIR, "scenario_B.json")
     data = load_json(path)
 
     print("\n--- Radar only baseline on Scenario B ---")
@@ -626,7 +629,7 @@ def validate_T5_scenario_C():
     print("T5 VALIDATION — SCENARIO C — RADAR + CAMERA + AIS")
     print("=" * 70)
 
-    path = "harbour_sim_output/scenario_C.json"
+    path = os.path.join(_SCENARIO_DIR, "scenario_C.json")
     data = load_json(path)
 
     print("\n--- Without AIS: radar + camera ---")
