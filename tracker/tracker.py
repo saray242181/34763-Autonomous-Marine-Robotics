@@ -42,9 +42,7 @@ def extract_estimates(history):
     return np.array(times), np.array(est_N), np.array(est_E)
 
 
-def plot_results(data, history):
-    times, est_N, est_E = extract_estimates(history)
-
+def get_first_ground_truth(data):
     gt = data["ground_truth"]
     target_id = list(gt.keys())[0]
     truth = np.asarray(gt[target_id], dtype=float)
@@ -54,19 +52,18 @@ def plot_results(data, history):
 
     valid = ~np.isnan(gt_N)
 
-    plt.figure(figsize=(8, 6))
-    plt.plot(gt_E[valid], gt_N[valid], label="Ground Truth")
-    plt.plot(est_E, est_N, label="EKF Track")
+    return gt_N, gt_E, valid, target_id
 
-    plt.xlabel("East [m]")
-    plt.ylabel("North [m]")
-    plt.title("Ground Truth vs EKF")
-    plt.axis("equal")
-    plt.grid()
-    plt.legend()
-    plt.show()
+
+def compute_rmse(data, history):
+    _, est_N, est_E = extract_estimates(history)
+
+    gt_N, gt_E, valid, _ = get_first_ground_truth(data)
 
     n = min(len(est_N), np.sum(valid))
+
+    if n == 0:
+        return np.nan
 
     rmse = np.sqrt(
         np.mean(
@@ -75,7 +72,123 @@ def plot_results(data, history):
         )
     )
 
-    print("Position RMSE [m]:", rmse)
+    return rmse
+
+
+def plot_harbour_debug(data, history):
+    measurements = data["measurements"]
+
+    times, est_N, est_E = extract_estimates(history)
+    gt_N, gt_E, valid, target_id = get_first_ground_truth(data)
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle("Harbour Surveillance Tracking Result")
+
+    # --------------------------------------------------
+    # 1. 2-D NED scene
+    # --------------------------------------------------
+    ax = axs[0, 0]
+
+    ax.plot(gt_E[valid], gt_N[valid], label=f"Ground Truth Target {target_id}")
+    ax.plot(est_E, est_N, label="EKF Track")
+
+    # Radar FOV
+    radar_circle = plt.Circle(
+        (0, 0),          # x = East, y = North
+        1000,
+        fill=False,
+        linestyle="--",
+        alpha=0.4,
+        label="Radar FOV",
+        color="green",
+    )
+    ax.add_patch(radar_circle)
+
+    # Camera approximate FOV/range circle
+    camera_pos_NE = np.array([-80.0, 120.0])  # [N, E]
+    camera_circle = plt.Circle(
+        (camera_pos_NE[1], camera_pos_NE[0]),  # x = E, y = N
+        500,
+        fill=False,
+        linestyle="--",
+        alpha=0.4,
+        label="Camera range",
+        color="red",
+    )
+    ax.add_patch(camera_circle)
+
+    ax.scatter(0, 0, marker="^", label="Radar")
+    ax.scatter(camera_pos_NE[1], camera_pos_NE[0], marker="s", label="Camera")
+
+    ax.set_xlabel("East [m]")
+    ax.set_ylabel("North [m]")
+    ax.set_title("2-D NED")
+    ax.axis("equal")
+    ax.grid(True)
+    ax.legend()
+
+    # --------------------------------------------------
+    # 2. Range measurements
+    # --------------------------------------------------
+    ax = axs[0, 1]
+
+    for sensor in ["radar", "camera"]:
+        t = []
+        r = []
+
+        for m in measurements:
+            if m["sensor_id"].lower() == sensor and "range_m" in m:
+                t.append(m["time"])
+                r.append(m["range_m"])
+
+        if len(t) > 0:
+            ax.scatter(t, r, s=8, label=sensor)
+
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Range [m]")
+    ax.set_title("Range measurements")
+    ax.grid(True)
+    ax.legend()
+
+    # --------------------------------------------------
+    # 3. Bearing measurements
+    # --------------------------------------------------
+    ax = axs[1, 0]
+
+    for sensor in ["radar", "camera"]:
+        t = []
+        b = []
+
+        for m in measurements:
+            if m["sensor_id"].lower() == sensor and "bearing_rad" in m:
+                t.append(m["time"])
+                b.append(np.rad2deg(m["bearing_rad"]))
+
+        if len(t) > 0:
+            ax.scatter(t, b, s=8, label=sensor)
+
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Bearing [deg]")
+    ax.set_title("Bearing measurements")
+    ax.grid(True)
+    ax.legend()
+
+    # --------------------------------------------------
+    # 4. EKF estimated position over time
+    # --------------------------------------------------
+    ax = axs[1, 1]
+
+    ax.plot(times, est_N, label="Estimated North")
+    ax.plot(times, est_E, label="Estimated East")
+
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Position [m]")
+    ax.set_title("EKF estimated states")
+    ax.grid(True)
+    ax.legend()
+
+    plt.tight_layout()
+    plt.show()
 
 
 def main(json_path, allowed_sensors=("radar", "camera", "ais")):
@@ -115,18 +228,29 @@ def main(json_path, allowed_sensors=("radar", "camera", "ais")):
     print("Final state [N, E, vN, vE]:")
     print(ekf.x.flatten())
 
-    plot_results(data, history)
+    rmse = compute_rmse(data, history)
+    print("Position RMSE [m]:", rmse)
+
+    plot_harbour_debug(data, history)
 
     return tracker_ext
 
 
 if __name__ == "__main__":
+    # Scenario A: radar only
     tracker = main(
-        "harbour_sim_output/scenario_B.json",
-        allowed_sensors=("radar", "camera"),
+        "harbour_sim_output/scenario_A.json",
+        allowed_sensors=("radar",),
     )
 
-    # For Scenario C with AIS, use:
+    # Scenario B: radar + camera
+    #
+    # tracker = main(
+    #     "harbour_sim_output/scenario_B.json",
+    #     allowed_sensors=("radar", "camera"),
+    # )
+
+    # Scenario C: radar + camera + AIS
     #
     # tracker = main(
     #     "harbour_sim_output/scenario_C.json",
