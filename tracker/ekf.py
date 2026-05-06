@@ -110,3 +110,14 @@ class EKF:
         ])
 
         return Q
+    
+    # code to try
+    # def _process_noise(self, dt: float) -> np.ndarray:
+    #     q = self.sigma_a**2
+
+    #     return q * np.array([
+    #         [dt**4 / 4, 0, dt**3 / 2, 0],
+    #         [0, dt**4 / 4, 0, dt**3 / 2],
+    #         [dt**3 / 2, 0, dt**2, 0],
+    #         [0, dt**3 / 2, 0, dt**2],
+    #     ])
